@@ -1,12 +1,15 @@
 import numpy as np
 import torch
+import random
+import math
+
 from rlbot.agents.base_agent import BaseAgent, SimpleControllerState
 from rlbot.utils.structures.game_data_struct import GameTickPacket
 from rlbot.utils.structures.quick_chats import QuickChats
 from rlgym_compat import GameState
 
-from .agent import Agent
-from .nexto_obs import NextoObsBuilder, BOOST_LOCATIONS
+from agent import Agent
+from nexto_obs import NextoObsBuilder, BOOST_LOCATIONS
 
 KICKOFF_CONTROLS = (
         11 * 4 * [SimpleControllerState(throttle=1, boost=True)]
@@ -48,7 +51,7 @@ class Nexto(BaseAgent):
         self.prev_time = 0
         self.kickoff_index = -1
         self.field_info = None
-
+        self.gamemode = None
 
         # toxic handling
         self.isToxic = False
@@ -63,14 +66,14 @@ class Nexto(BaseAgent):
         self.demoCalloutCount = 0
         self.lastPacket = None
 
-        print('Nexto Ready - Index:', index, 'Beta:', str(beta))   
+        print('Nexto Ready - Index:', index)
         print("Remember to run Nexto at 120fps with vsync off! "
               "Stable 240/360 is second best if that's better for your eyes")
         print("Also check out the RLGym Twitch stream to watch live bot training and occasional showmatches!")
 
-    def initialize_agent(self, field_info):
+    def initialize_agent(self):
         # Initialize the rlgym GameState object now that the game is active and the info is available
-        self.field_info = field_info
+        self.field_info = self.get_field_info()
         self.obs_builder = NextoObsBuilder(field_info=self.field_info)
         self.game_state = GameState(self.field_info)
         self.ticks = self.tick_skip  # So we take an action the first tick
@@ -79,7 +82,20 @@ class Nexto(BaseAgent):
         self.action = np.zeros(8)
         self.update_action = True
         self.kickoff_index = -1
+        match_settings = self.get_match_settings()
+        mutators = match_settings.MutatorSettings()
+        # Examples
 
+        # Game mode
+        game_modes = (
+            "soccer",
+            "hoops",
+            "dropshot",
+            "hockey",
+            "rumble",
+            "heatseeker"
+        )
+        self.gamemode = game_modes[match_settings.GameMode()]
 
     def render_attention_weights(self, weights, positions, n=3):
         if weights is None:
@@ -107,6 +123,8 @@ class Nexto(BaseAgent):
         self.renderer.end_rendering()
 
     def get_output(self, packet: GameTickPacket) -> SimpleControllerState:
+        self.update_agent(game_tick_packet)
+        controls = SimpleControllerState()
         cur_time = packet.game_info.seconds_elapsed
         delta = cur_time - self.prev_time
         self.prev_time = cur_time
@@ -127,7 +145,9 @@ class Nexto(BaseAgent):
 
             self.game_state.players = [player] + teammates + opponents
 
-  
+            if self.gamemode == "heatseeker":
+                self._modify_ball_info_for_heatseeker(packet, self.game_state)
+
             obs = self.obs_builder.build_obs(player, self.game_state, self.action)
 
             beta = self.beta
@@ -154,7 +174,62 @@ class Nexto(BaseAgent):
         if self.hardcoded_kickoffs:
             self.maybe_do_kickoff(packet, ticks_elapsed)
 
+        if self.should_attempt_reset(game_tick_packet):
+            controls = self.attempt_reset(game_tick_packet)
+        else:
+            controls = self.perform_standard_play(game_tick_packet)
+
         return self.controls
+
+    def should_attempt_reset(self, game_tick_packet: GameTickPacket) -> bool:
+        car = game_tick_packet.game_cars[self.index]
+        ball = game_tick_packet.game_ball
+        distance_to_ball = math.sqrt((car.physics.location.x - ball.physics.location.x)**2 +
+                                     (car.physics.location.y - ball.physics.location.y)**2 +
+                                     (car.physics.location.z - ball.physics.location.z)**2)
+        car_in_air = car.physics.location.z > 100
+        
+        return distance_to_ball < 300 and car_in_air
+
+    def attempt_reset(self, game_tick_packet: GameTickPacket) -> SimpleControllerState:
+        controls = SimpleControllerState()
+        car = game_tick_packet.game_cars[self.index]
+        ball = game_tick_packet.game_ball
+        
+        car_to_ball = [
+            ball.physics.location.x - car.physics.location.x,
+            ball.physics.location.y - car.physics.location.y,
+            ball.physics.location.z - car.physics.location.z,
+        ]
+        
+        car_forward = [
+            math.cos(car.physics.rotation.yaw) * math.cos(car.physics.rotation.pitch),
+            math.sin(car.physics.rotation.yaw) * math.cos(car.physics.rotation.pitch),
+            math.sin(car.physics.rotation.pitch)
+        ]
+        
+        dot_product = sum(a * b for a, b in zip(car_forward, car_to_ball))
+        norm_car_to_ball = math.sqrt(sum(x * x for x in car_to_ball))
+        norm_car_forward = math.sqrt(sum(x * x for x in car_forward))
+        
+        angle_to_ball = math.acos(dot_product / (norm_car_to_ball * norm_car_forward))
+
+        if angle_to_ball > 0.1:
+            controls.steer = 1.0 if car_to_ball[1] > 0 else -1.0
+        else:
+            controls.steer = 0.0
+        
+        if car_to_ball[2] > 100:
+            controls.pitch = -1.0 
+        elif car_to_ball[2] < -100:
+            controls.pitch = 1.0
+        else:
+            controls.pitch = 0.0
+        
+        controls.boost = True
+        controls.throttle = 1.0
+
+        return controls
 
     def maybe_do_kickoff(self, packet, ticks_elapsed):
         if packet.game_info.is_kickoff_pause:
@@ -199,6 +274,27 @@ class Nexto(BaseAgent):
         self.controls.jump = action[5] > 0
         self.controls.boost = action[6] > 0
         self.controls.handbrake = action[7] > 0
+        if self.gamemode == "rumble":
+            self.controls.use_item = np.random.random() > (self.tick_skip / 1200)  # On average once every 10 seconds
+
+    def _modify_ball_info_for_heatseeker(self, packet, game_state):
+        assert self.field_info.num_goals == 2
+        target_goal = self.field_info.goals[self.team].location
+        target_goal = np.array([target_goal.x, target_goal.y, target_goal.z])
+
+        ball_pos = game_state.ball.position
+        ball_vel = game_state.ball.linear_velocity
+        vel_mag = np.linalg.norm(ball_vel)
+
+        current_dir = ball_vel / vel_mag
+
+        goal_dir = target_goal - ball_pos
+        goal_dist = np.linalg.norm(goal_dir)
+        goal_dir = goal_dir / goal_dist
+
+        self.game_state.ball.linear_velocity = 1.1 * vel_mag * (
+                    goal_dir + (current_dir if packet.game_ball.latest_touch.team != self.team else goal_dir)) / 2
+        self.game_state.inverted_ball.linear_velocity = self.game_state.ball.linear_velocity * np.array([-1, -1, 1])
 
 
     def toxicity(self, packet):
@@ -217,7 +313,7 @@ class Nexto(BaseAgent):
 
         humanMates = [p for p in packet.game_cars[:packet.num_cars] if p.team == self.team and p.is_bot is False]
         humanOpps = [p for p in packet.game_cars[:packet.num_cars] if p.team != self.team and p.is_bot is False]
-        goodGoal = [0, -5120] if self.team == 1 else [0, 5120]
+        goodGoal = [0, -5120] if self.team == 0 else [0, 5120]
         badGoal = [0, 5120] if self.team == 0 else [0, -5120]
 
         if player.is_demolished and self.demoedTickCount == 0:  # and not self.lastFrameDemod:
@@ -278,7 +374,7 @@ class Nexto(BaseAgent):
         if scoredOn:
             for p in humanMates:
                 d = math.sqrt((p.physics.location.x - goodGoal[0]) ** 2 + (p.physics.location.y - goodGoal[1]) ** 2)
-                if d < 2000:
+                if d < 3000:
                     i = random.randint(0, 2)
                     if i == 0:
                         self.send_quick_chat(QuickChats.CHAT_EVERYONE, QuickChats.Compliments_NiceBlock)
@@ -344,7 +440,3 @@ class Nexto(BaseAgent):
 
         if self.pesterCount > 0:
             self.pesterCount -= 1
-
-
-
-
