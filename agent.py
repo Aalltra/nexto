@@ -9,12 +9,29 @@ from torch.distributions import Categorical
 
 class Agent:
     def __init__(self):
+        self.index = None
         cur_dir = os.path.dirname(os.path.realpath(__file__))
         with open(os.path.join(cur_dir, "nexto-model.pt"), 'rb') as f:
             self.actor = torch.jit.load(f)
         torch.set_num_threads(1)
         self._lookup_table = self.make_lookup_table()
         self.state = None
+
+    def compute_reward(self, game_tick_packet, previous_game_tick_packet):
+        reward = 0
+        
+        if game_tick_packet.game_ball.latest_touch.player_name == self.name:
+            if game_tick_packet.game_ball.latest_touch.time_seconds!= previous_game_tick_packet.game_ball.latest_touch.time_seconds:
+                reward += 100
+        
+        if self.is_reset_successful(game_tick_packet):
+            reward += 50
+        
+        return reward
+
+    def is_reset_successful(self, game_tick_packet):
+        car = game_tick_packet.game_cars[self.index]
+        return all_wheels_touched(car)
 
     @staticmethod
     def make_lookup_table():
@@ -24,7 +41,7 @@ class Agent:
             for steer in (-1, 0, 1):
                 for boost in (0, 1):
                     for handbrake in (0, 1):
-                        if boost == 1 and throttle != 1:
+                        if boost == 1 and throttle!= 1:
                             continue
                         actions.append([throttle or boost, steer, 0, steer, 0, 0, boost, handbrake])
         # Aerial
@@ -33,18 +50,19 @@ class Agent:
                 for roll in (-1, 0, 1):
                     for jump in (0, 1):
                         for boost in (0, 1):
-                            if jump == 1 and yaw != 0:  # Only need roll for sideflip
+                            if jump == 1 and yaw!= 0:  # Only need roll for sideflip
                                 continue
                             if pitch == roll == jump == 0:  # Duplicate with ground
                                 continue
                             # Enable handbrake for potential wavedashes
-                            handbrake = jump == 1 and (pitch != 0 or yaw != 0 or roll != 0)
+                            handbrake = jump == 1 and (pitch!= 0 or yaw!= 0 or roll!= 0)
                             actions.append([boost, yaw, pitch, yaw, roll, jump, boost, handbrake])
         actions = np.array(actions)
         return actions
 
     def act(self, state, beta):
         state = tuple(torch.from_numpy(s).float() for s in state)
+        self.index = state[0].car_id
 
         with torch.no_grad():
             out, weights = self.actor(state)
