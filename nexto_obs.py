@@ -136,16 +136,17 @@ class BatchedObsBuilder:
         self._reset(initial_state)
 
     def build_obs(self, player: PlayerData, state: GameState, previous_action: np.ndarray) -> Any:
-        # if state != self.current_state:
-        self.current_obs = self.batched_build_obs(
-            np.expand_dims(encode_gamestate(state), axis=0)
-        )
-        self.current_state = state
+    # if state != self.current_state:
+    self.current_obs = self.batched_build_obs(
+        np.expand_dims(encode_gamestate(state), axis=0)
+    )
+    self.current_state = state
 
-        for i, p in enumerate(state.players):
-            if p == player:
-                self.add_actions(self.current_obs, previous_action, i)
-                return self.current_obs[i]
+    self.index = player.car_id
+    for i, p in enumerate(state.players):
+        if p == player:
+            self.add_actions(self.current_obs, previous_action, i)
+            return self.current_obs[i]
 
 
 IS_SELF, IS_MATE, IS_OPP, IS_BALL, IS_BOOST = range(5)
@@ -244,6 +245,7 @@ class NextoObsBuilder(BatchedObsBuilder):
         ball_start_index = 3 + len(self._boost_locations)
         players_start_index = ball_start_index + BALL_STATE_LENGTH
         player_length = PLAYER_INFO_LENGTH
+        features = self.extract_features(encoded_states)
 
         n_players = (encoded_states.shape[1] - players_start_index) // player_length
         lim_players = n_players if self.n_players is None else self.n_players
@@ -314,3 +316,27 @@ class NextoObsBuilder(BatchedObsBuilder):
         else:
             q, kv, m = obs[player_index]
             q[:, 0, ACTIONS] = previous_actions
+
+    def extract_features(self, game_tick_packet):
+        features = []
+        car = game_tick_packet.game_cars[self.index]
+        ball = game_tick_packet.game_ball
+        
+        features.append(car.physics.location.x)
+        features.append(car.physics.location.y)
+        features.append(car.physics.location.z)
+        features.append(car.physics.velocity.x)
+        features.append(car.physics.velocity.y)
+        features.append(car.physics.velocity.z)
+        features.append(car.physics.rotation.pitch)
+        features.append(car.physics.rotation.yaw)
+        features.append(car.physics.rotation.roll)
+        
+        features.append(ball.physics.location.x)
+        features.append(ball.physics.location.y)
+        features.append(ball.physics.location.z)
+        features.append(ball.physics.velocity.x)
+        features.append(ball.physics.velocity.y)
+        features.append(ball.physics.velocity.z)
+        
+        return features
